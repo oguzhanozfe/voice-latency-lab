@@ -32,7 +32,7 @@ It also simulates two kinds of barge-in on the sentence strategy and measures th
 - **after first token**: the user resumes talking 0.3 s after the reply started generating, for example after a false end-of-turn.
 - **after first audio**: the user talks over the reply 0.3 s after its first audio is ready.
 
-The LLM is cancelled by shutting down its HTTP socket from outside the blocking read, which makes Ollama stop generating. TTS is cancelled by killing the synthesis process. After each barge-in a tiny request is sent straight away; if its time to first token matches normal turns, the cancelled generation really stopped instead of running on in the background.
+The LLM is cancelled by shutting down its HTTP socket from outside the blocking read, which should make Ollama stop generating. TTS is cancelled by killing the synthesis process. After each barge-in a tiny request is sent straight away; a time to first token like that of normal turns is consistent with the cancelled generation having stopped.
 
 Playback is simulated from each chunk's audio length (chunk *i* starts at the later of "ready" and "chunk *i−1* finished"). Nothing goes to a speaker, so runs are repeatable and quiet.
 
@@ -87,7 +87,7 @@ Run [`results/m5pro-qwen3.5-9b`](results/m5pro-qwen3.5-9b): Apple M5 Pro, 24 GB,
 
 That is 12 utterances × 3 repetitions = **36 turns per row**, 360 turns in all, none skipped. Package versions and model file hashes are in [`env.json`](results/m5pro-qwen3.5-9b/env.json), every event is in `turns.jsonl`, and the timelines are in [`waterfall.html`](results/m5pro-qwen3.5-9b/waterfall.html), which shows the first repetition.
 
-**The machine was not idle.** Other jobs shared this Mac, so the per-turn 1-minute load average ran from 2.3 to 10.1 (median 5.0). In one stretch of about 70 consecutive turns, another process was using Ollama, and time to first token went above 1 s. The **p50 values are the comparison**; the p95 values mostly show that contention, not the pipeline.
+**The machine was not idle.** Other jobs shared this Mac, so the per-turn 1-minute load average ran from 2.3 to 10.1 (median 5.0). 67 of the 360 turns, all between run positions 82 and 337, took more than 1 s to the first token, most likely because another process was using Ollama at the time. The **p50 values are the comparison**; the p95 values mostly show that contention, not the pipeline.
 
 Time from the end of the user's speech to the first audio chunk ready, in ms:
 
@@ -96,21 +96,21 @@ Time from the end of the user's speech to the first audio chunk ready, in ms:
 | `say` (process per chunk) | 2397 | 1661 | 1637 |
 | Piper (in-process) | 1629 | 800 | 771 |
 
-The p50 parts of one Piper sentence-streaming turn: STT 254 ms, first LLM token 70 ms after the transcript, first audio 542 ms after the transcript. The full table is in [`summary.md`](results/m5pro-qwen3.5-9b/summary.md).
+The p50 parts of one Piper sentence-streaming turn: STT 254 ms, first LLM token 70 ms after the transcript, first audio 542 ms after the transcript. The full table and the run-level checks quoted below are in [`summary.md`](results/m5pro-qwen3.5-9b/summary.md).
 
 What the numbers say:
 
 - **Sentence streaming is the trick that matters.** It cuts first audio by about 0.8 s with Piper and about 0.7 s with `say`, because the first sentence of a reply (p50 35 words) is synthesized while the LLM is still writing the rest.
 - **Starting at the first clause adds almost nothing**: 24–29 ms. Short openers ("Sure,") are merged into the next chunk (minimum 3 words), and the first sentences here are short anyway.
 - **The TTS engine matters as much as the strategy.** `say` launches a process per chunk: TTS real-time factor 0.18 (time spent synthesizing ÷ length of audio produced). Piper keeps its voice loaded: real-time factor 0.02. Piper with no streaming (1629 ms) is about as fast as `say` with streaming (1661 ms).
-- **No mid-reply silence in any turn** (gap p95 = 0). Both engines synthesize much faster than the audio plays, so once the first chunk is ready the rest keeps up.
+- **No mid-reply silence in any turn**: 0 of 216 non-barge-in turns had a gap. Both engines synthesize much faster than the audio plays, so once the first chunk is ready the rest keeps up.
 - **STT costs about 255 ms** for 2.5–5.1 s questions (real-time factor 0.08, the time to transcribe ÷ length of the recording). The word error rate is 0 on every utterance except one: "opened electronics" became "open electronics" in all 30 of that utterance's turns.
 - **Barge-in is cheap to cancel.** Shutting the Ollama socket stops the LLM in under 1 ms (p95 1 ms). Killing `say` takes 1–3 ms. Piper cannot be interrupted mid-inference, so cancel waits for the current sentence: p50 0 ms, p95 40 ms. Of 144 barge-ins, the LLM was still generating in 102.
-- **Cancelled generations really stop.** A tiny request sent straight after each barge-in got its first token in 169 ms (p50). That matches the 153 ms of other requests whose prompt was not already cached, so Ollama was not still working on the cancelled reply.
+- **Cancelled generations appear to stop.** A tiny request sent straight after each barge-in got its first token in 169 ms (p50), close to the 150 ms of other turns whose prompt was not cached. The turn after a barge-in also decoded at full speed: 44.8 tok/s against 42.7 for other turns. Both are consistent with Ollama dropping the cancelled reply, though neither proves it.
 
 ### Cloud comparison: Gemini instead of the local LLM
 
-Run [`results/m5pro-gemini-3.5-flash-lite`](results/m5pro-gemini-3.5-flash-lite) uses the same STT, Piper and utterances, with Gemini `gemini-3.5-flash-lite` instead of Ollama. It streams through the OpenAI-compatible endpoint with minimal reasoning, on the free tier with a key shared by other jobs. It is one repetition (12 utterances × 5 turn types = 60 turns), 4 requests were rate-limited and retried as whole turns, and none were skipped.
+Run [`results/m5pro-gemini-3.5-flash-lite`](results/m5pro-gemini-3.5-flash-lite) uses the same STT, Piper and utterances, with Gemini `gemini-3.5-flash-lite` instead of Ollama. It streams through the OpenAI-compatible endpoint with minimal reasoning, on the free tier with a key shared by other jobs. It is one repetition (12 utterances × 5 turn types = 60 turns), and no turn was skipped. Rate-limited requests are retried as whole turns, so the waiting never counts toward the times.
 
 | LLM | time to first token, p50 / p95 (all Piper turns) | sentence streaming: speech end to first audio, p50 |
 |---|---|---|
@@ -119,7 +119,7 @@ Run [`results/m5pro-gemini-3.5-flash-lite`](results/m5pro-gemini-3.5-flash-lite)
 
 On this setup the local 9B model starts answering about 1.2 s sooner at the median, and its worst cases are far less extreme. The cloud numbers depend on free-tier queueing and the network on this day, not just on the model, so read them as one sample. Its LLM had already finished in 21 of the 24 barge-ins. A likely reason is that Gemini streams in a few large pieces: one response checked by hand arrived in three. The run files do not record piece counts.
 
-A confound to know about: Ollama caches the prompt prefix, and the turns for one utterance run back to back. A turn that repeats the previous turn's prompt gets its first token in about 91 ms (p50, 324 turns). A turn with a new prompt takes about 153 ms (36 turns). The "full" turn always comes first for each utterance, after a probe with a different prompt, so it pays about 60–80 ms more. That is small next to the 700–800 ms streaming gain, but the gaps between rows are slightly inflated by it.
+A confound to know about: Ollama caches the prompt prefix, and the turns for one utterance run back to back. A turn that repeats the previous turn's prompt gets its first token in 68 ms (p50, 216 turns). A turn that follows a probe or a new utterance takes 150 ms (144 turns). The "full" turns and the "barge-in after first audio" turns always follow a probe or a new utterance, so they pay about 80 ms more. That is small next to the 700–800 ms streaming gain, but the gaps between rows are slightly inflated by it.
 
 ## Known limits
 

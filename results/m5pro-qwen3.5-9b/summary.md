@@ -61,4 +61,14 @@ Times in ms (p50 / p95), RTF = processing time / audio length.
 
 Barge-ins: 144; the LLM was still generating at the interrupt in 102 of them. 'cancel LLM' and 'cancel TTS' only count turns where that stage still had work.
 
-After each barge-in a tiny request was sent at once. Its time to first token: p50 169 ms / p95 4801 ms (normal turns: p50 70 ms). Similar numbers mean the cancelled generation really stopped instead of running on in the background.
+After each barge-in a tiny request was sent at once. Its time to first token: p50 169 ms / p95 4801 ms (normal turns: p50 70 ms). Similar numbers are consistent with the cancelled generation having stopped (a probe alone cannot prove it if Ollama runs parallel slots).
+
+## Run-level checks
+
+- 1-minute load average per turn: min 2.34, median 5.03, max 10.13.
+- Turns with time to first token over 1 s: 67 of 360 (run-order indices 82–337).
+- Time to first token, say turns (n=180): p50 145 ms, p95 4368 ms.
+- Time to first token, piper turns (n=180): p50 145 ms, p95 5300 ms.
+- Mid-reply gaps: 0 of 216 non-barge-in turns had one; max 0 ms.
+- Prompt cache: turns repeating the previous turn's prompt got the first token in p50 68 ms (n=216); turns after a probe or a new utterance in 150 ms (n=144).
+- Decode speed of the turn right after a barge-in: p50 44.8 tok/s (n=113), other turns 42.7 tok/s (n=145).

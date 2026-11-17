@@ -217,6 +217,42 @@ def run(a):
     report(out)
 
 
+def extra_stats(turns: list[dict]) -> list[str]:
+    """Run-level checks quoted in the README, recomputed from turns.jsonl."""
+    ms = [metrics(t) for t in turns]
+    ms_ms = lambda xs, q: f"{pct(xs, q) * 1000:.0f}"  # noqa: E731
+    lines = ["## Run-level checks", ""]
+    loads = [t["loadavg_1m"] for t in turns if "loadavg_1m" in t]
+    if loads:
+        lines.append(f"- 1-minute load average per turn: min {min(loads)}, median {pct(loads, 50):.2f}, max {max(loads)}.")
+    slow = [i for i, m in enumerate(ms) if (m.get("ttft_s") or 0) > 1]
+    lines.append(f"- Turns with time to first token over 1 s: {len(slow)} of {len(turns)}"
+                 + (f" (run-order indices {slow[0]}–{slow[-1]})." if slow else "."))
+    groups: dict[str, list] = {}
+    for t, m in zip(turns, ms):
+        groups.setdefault(t["mode"].split(" · ")[0] if " · " in t["mode"] else "all", []).append(m["ttft_s"])
+    for g, xs in groups.items():
+        lines.append(f"- Time to first token, {g} turns (n={len(xs)}): p50 {ms_ms(xs, 50)} ms, p95 {ms_ms(xs, 95)} ms.")
+    gaps = [m["gap_s"] for m in ms if m.get("gap_s") is not None]
+    if gaps:
+        lines.append(f"- Mid-reply gaps: {sum(g > 0 for g in gaps)} of {len(gaps)} non-barge-in turns had one; max {max(gaps) * 1000:.0f} ms.")
+    rep, cold, after, other = [], [], [], []
+    for i, (t, m) in enumerate(zip(turns, ms)):
+        prev = turns[i - 1] if i else None
+        fresh = prev is None or prev["utt"] != t["utt"] or "probe_ttft_s" in prev
+        (cold if fresh else rep).append(m["ttft_s"])
+        if m.get("tok_per_s"):
+            (after if prev is not None and "probe_ttft_s" in prev else other).append(m["tok_per_s"])
+    if rep and cold:
+        lines.append(f"- Prompt cache: turns repeating the previous turn's prompt got the first token in p50 "
+                     f"{ms_ms(rep, 50)} ms (n={len(rep)}); turns after a probe or a new utterance in "
+                     f"{ms_ms(cold, 50)} ms (n={len(cold)}).")
+    if after and other:
+        lines.append(f"- Decode speed of the turn right after a barge-in: p50 {pct(after, 50):.1f} tok/s (n={len(after)}), "
+                     f"other turns {pct(other, 50):.1f} tok/s (n={len(other)}).")
+    return lines + [""]
+
+
 def report(out: Path):
     turns = [json.loads(line) for line in (out / "turns.jsonl").read_text().splitlines()]
     env = json.loads((out / "env.json").read_text())
@@ -233,8 +269,9 @@ def report(out: Path):
     if probes:
         md += [f"After each barge-in a tiny request was sent at once. Its time to first token: "
                f"p50 {pct(probes, 50) * 1000:.0f} ms / p95 {pct(probes, 95) * 1000:.0f} ms "
-               f"(normal turns: p50 {pct(normal, 50) * 1000:.0f} ms). Similar numbers mean the cancelled "
-               f"generation really stopped instead of running on in the background.", ""]
+               f"(normal turns: p50 {pct(normal, 50) * 1000:.0f} ms). Similar numbers are consistent with "
+               f"the cancelled generation having stopped (a probe alone cannot prove it if Ollama runs parallel slots).", ""]
+    md += extra_stats(turns)
     (out / "summary.md").write_text("\n".join(md))
     first_rep = [t for t in turns if t.get("rep", 0) == 0]
     (out / "waterfall.html").write_text(waterfall_html(first_rep, f"Voice turn waterfall: {out.name}", env))
