@@ -100,13 +100,24 @@ The p50 parts of one Piper sentence-streaming turn: STT 254 ms, first LLM token 
 
 What the numbers say:
 
-- **Sentence streaming is the trick that matters.** It cuts first audio by about 0.8 s with Piper and about 0.7 s with `say`, because the first sentence (about a third of a 35-word reply) is synthesized while the LLM is still writing the rest.
+- **Sentence streaming is the trick that matters.** It cuts first audio by about 0.8 s with Piper and about 0.7 s with `say`, because the first sentence of a reply (p50 35 words) is synthesized while the LLM is still writing the rest.
 - **Starting at the first clause adds almost nothing**: 24–29 ms. Short openers ("Sure,") are merged into the next chunk (minimum 3 words), and the first sentences here are short anyway.
 - **The TTS engine matters as much as the strategy.** `say` launches a process per chunk: TTS real-time factor 0.18 (time spent synthesizing ÷ length of audio produced). Piper keeps its voice loaded: real-time factor 0.02. Piper with no streaming (1629 ms) is about as fast as `say` with streaming (1661 ms).
 - **No mid-reply silence in any turn** (gap p95 = 0). Both engines synthesize much faster than the audio plays, so once the first chunk is ready the rest keeps up.
-- **STT costs about 255 ms** for 2.5–4 s questions (real-time factor 0.08, the time to transcribe ÷ length of the recording). The word error rate is 0 on every utterance except one: "opened electronics" became "open electronics" in all 30 of that utterance's turns.
+- **STT costs about 255 ms** for 2.5–5.1 s questions (real-time factor 0.08, the time to transcribe ÷ length of the recording). The word error rate is 0 on every utterance except one: "opened electronics" became "open electronics" in all 30 of that utterance's turns.
 - **Barge-in is cheap to cancel.** Shutting the Ollama socket stops the LLM in under 1 ms (p95 1 ms). Killing `say` takes 1–3 ms. Piper cannot be interrupted mid-inference, so cancel waits for the current sentence: p50 0 ms, p95 40 ms. Of 144 barge-ins, the LLM was still generating in 102.
 - **Cancelled generations really stop.** A tiny request sent straight after each barge-in got its first token in 169 ms (p50). That matches the 153 ms of other requests whose prompt was not already cached, so Ollama was not still working on the cancelled reply.
+
+### Cloud comparison: Gemini instead of the local LLM
+
+Run [`results/m5pro-gemini-3.5-flash-lite`](results/m5pro-gemini-3.5-flash-lite) uses the same STT, Piper and utterances, with Gemini `gemini-3.5-flash-lite` instead of Ollama. It streams through the OpenAI-compatible endpoint with minimal reasoning, on the free tier with a key shared by other jobs. It is one repetition (12 utterances × 5 turn types = 60 turns), 4 requests were rate-limited and retried as whole turns, and none were skipped.
+
+| LLM | time to first token, p50 / p95 (all Piper turns) | sentence streaming: speech end to first audio, p50 |
+|---|---|---|
+| local `qwen3.5:9b` (180 turns) | 145 / 5300 ms | 800 ms |
+| Gemini free tier, cloud (60 turns) | 1307 / 14354 ms | 1301 ms |
+
+On this setup the local 9B model starts answering about 1.2 s sooner at the median, and its worst cases are far less extreme. The cloud numbers depend on free-tier queueing and the network on this day, not just on the model, so read them as one sample. Gemini also streams in a few large pieces rather than token by token, so the LLM had already finished in 21 of its 24 barge-ins.
 
 A confound to know about: Ollama caches the prompt prefix, and the turns for one utterance run back to back. A turn that repeats the previous turn's prompt gets its first token in about 91 ms (p50, 324 turns). A turn with a new prompt takes about 153 ms (36 turns). The "full" turn always comes first for each utterance, after a probe with a different prompt, so it pays about 60–80 ms more. That is small next to the 700–800 ms streaming gain, but the gaps between rows are slightly inflated by it.
 
