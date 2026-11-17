@@ -2,9 +2,31 @@
 
 Measures where the time goes in a local voice-agent turn (speech to text → LLM → text to speech) and tests which streaming tricks actually shorten the wait before the agent starts talking.
 
+## Try it
+
+**Measured results, no install:** [oguzhanozfe.github.io/voice-latency-lab](https://oguzhanozfe.github.io/voice-latency-lab/): the p50 / p95 tables and per-turn waterfalls of the two committed runs.
+
+[![Per-turn waterfall of the local run: STT, LLM, TTS and simulated playback for each strategy](docs/screenshot.png)](https://oguzhanozfe.github.io/voice-latency-lab/m5pro-qwen3.5-9b/waterfall.html)
+
+**Demo, no keys, about 5 seconds:**
+
+```bash
+git clone https://github.com/oguzhanozfe/voice-latency-lab && cd voice-latency-lab
+python3 -m vlab demo
+open demo-out/waterfall.html
+```
+
+`demo` rebuilds `docs/` (the published page) from the committed run files, then runs 3 utterances through every strategy and barge-in and writes a waterfall to `demo-out/`. It uses whatever is installed and prints which:
+
+- **Ollama running with `qwen3.5:9b`** (or `--model`, `OLLAMA_URL`) and a TTS (Piper or macOS `say`): a live local run. faster-whisper is used too if it and the generated audio are present.
+- **Otherwise fake stages**, so it never fails for lack of a model; the timings are then synthetic and labelled `mode: fake stages`.
+- **Gemini** only on request, `--llm gemini`, and only if `GEMINI_API_KEY` is set. It is the only stage that leaves the machine.
+
+The full measurement is `python3 -m vlab run`, described under [Run it](#run-it).
+
 It is the measurement companion to [voice-support-agent](https://github.com/oguzhanozfe/voice-support-agent), a local voice support agent. That repo is about whether the agent answers correctly. This one is about how long the caller waits.
 
-The core is standard-library Python 3.10+. faster-whisper and Piper are optional extras. Every stage is pluggable, and the unit tests and CI run the whole loop with fake stages, so they need no model or audio.
+The core is standard-library Python 3.10+. faster-whisper and Piper are optional extras. Every stage is pluggable, and the unit tests and CI run the whole loop with fake stages, so they need no model or audio. CI also runs the demo and fails if the published page no longer matches the committed run files.
 
 ## What it measures
 

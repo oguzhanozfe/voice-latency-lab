@@ -5,10 +5,13 @@
   python -m vlab run --out results/x         measure (real stages where available)
   python -m vlab run --fake --out results/x  same loop with fake stages, no models needed
   python -m vlab report results/x            rebuild summary.md and waterfall.html
+  python -m vlab demo                        rebuild docs/ from committed runs, then a few turns with
+                                             whatever is installed (Ollama if running, else fake stages)
 """
 from __future__ import annotations
 
 import argparse
+import shutil
 import hashlib
 import importlib.metadata
 import json
@@ -24,7 +27,7 @@ from pathlib import Path
 
 from . import stages
 from .pipeline import MODES, metrics, pct, run_turn
-from .report import summary_table, waterfall_html
+from .report import index_html, summary_table, waterfall_html
 
 ROOT = Path(__file__).resolve().parent.parent
 AUDIO = ROOT / "audio"
@@ -253,7 +256,7 @@ def extra_stats(turns: list[dict]) -> list[str]:
     return lines + [""]
 
 
-def report(out: Path):
+def report(out: Path, quiet: bool = False):
     turns = [json.loads(line) for line in (out / "turns.jsonl").read_text().splitlines()]
     env = json.loads((out / "env.json").read_text())
     normal = [metrics(t).get("ttft_s") for t in turns
@@ -275,7 +278,50 @@ def report(out: Path):
     (out / "summary.md").write_text("\n".join(md))
     first_rep = [t for t in turns if t.get("rep", 0) == 0]
     (out / "waterfall.html").write_text(waterfall_html(first_rep, f"Voice turn waterfall: {out.name}", env))
-    print("\n".join(md))
+    if not quiet:
+        print("\n".join(md))
+
+
+REPO = "https://github.com/oguzhanozfe/voice-latency-lab"
+
+
+def build_site(docs: Path):
+    """Regenerate every committed run's report and copy them into docs/ (published by GitHub Pages)."""
+    runs = []
+    for out in sorted((p.parent for p in (ROOT / "results").glob("*/turns.jsonl")), reverse=True):  # local run first
+        report(out, quiet=True)
+        (docs / out.name).mkdir(parents=True, exist_ok=True)
+        shutil.copy(out / "waterfall.html", docs / out.name / "waterfall.html")
+        turns = [json.loads(line) for line in (out / "turns.jsonl").read_text().splitlines()]
+        runs.append((out.name, json.loads((out / "env.json").read_text()), summary_table(turns)))
+    (docs / "index.html").write_text(index_html(runs, REPO))
+    print(f"rebuilt {docs / 'index.html'} from {len(runs)} committed runs: " + ", ".join(r[0] for r in runs))
+
+
+def ollama_has(model: str) -> bool:
+    url = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+    try:
+        with urllib.request.urlopen(url + "/api/tags", timeout=1) as r:
+            return any(m.get("name") == model for m in json.load(r).get("models", []))
+    except (OSError, ValueError):
+        return False
+
+
+def demo(a):
+    build_site(ROOT / "docs")
+    found = stages.available()
+    tts = next((n for n in ("piper", "say") if found[n]), None)
+    if a.fake or tts is None or (a.llm == "ollama" and not ollama_has(a.model)) \
+            or (a.llm == "gemini" and not os.environ.get("GEMINI_API_KEY")):
+        mode, fake = "fake stages (no Ollama/TTS found, or --fake): timings are synthetic", True
+    else:
+        mode, fake = f"live: {a.llm} {a.model if a.llm == 'ollama' else ''}, TTS {tts}", False
+    has_audio = all(u.wav for u in load_utterances()[:3])
+    stt = "faster-whisper" if found["faster-whisper"] and has_audio else "oracle"
+    print(f"mode: {mode}", file=sys.stderr)
+    run(argparse.Namespace(out=a.out, fake=fake, llm=a.llm, model=a.model, voice="Samantha", stt=stt,
+                           stt_device="cpu", tts=tts or "say", reps=1, limit=3, barge_in_after=0.3))
+    print(f"\nmode: {mode}\nopen {a.out}/waterfall.html  (published runs: docs/index.html)")
 
 
 def main(argv=None):
@@ -298,6 +344,11 @@ def main(argv=None):
     r.add_argument("--limit", type=int, default=0, help="only the first N utterances")
     r.add_argument("--barge-in-after", type=float, default=0.3,
                    help="seconds after the anchor (first token / first audio chunk) when the user interrupts")
+    d = sub.add_parser("demo", help="no keys needed")
+    d.add_argument("--out", default="demo-out")
+    d.add_argument("--fake", action="store_true", help="force fake stages")
+    d.add_argument("--llm", default="ollama", choices=["ollama", "gemini"], help="gemini only if GEMINI_API_KEY is set")
+    d.add_argument("--model", default=os.environ.get("VLAB_MODEL", "qwen3.5:9b"))
     rp = sub.add_parser("report")
     rp.add_argument("out")
     a = p.parse_args(argv)
@@ -307,6 +358,8 @@ def main(argv=None):
         gen_utterances(a.voice)
     elif a.cmd == "run":
         run(a)
+    elif a.cmd == "demo":
+        demo(a)
     else:
         report(Path(a.out))
 
