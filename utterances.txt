@@ -1,0 +1,13 @@
+# id|text  — the fixed set. Audio is generated locally with `python -m vlab gen-utterances` (not committed).
+u01|Hi, where is my order? It was supposed to arrive yesterday.
+u02|Can I change the delivery address for the order I placed this morning?
+u03|I was charged twice for the same item. What should I do?
+u04|How do I return a pair of shoes that don't fit?
+u05|What is your refund policy for opened electronics?
+u06|My discount code says it has expired, but the email said it is valid until Sunday.
+u07|Can you tell me if the blue backpack is back in stock?
+u08|I forgot my password and the reset email never arrives.
+u09|Do you ship to Canada, and how long does it take?
+u10|The package was left outside and now it is missing.
+u11|Can I cancel my subscription before the next billing date?
+u12|I'd like to speak to a person, please.

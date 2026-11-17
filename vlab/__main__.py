@@ -1,0 +1,201 @@
+"""voice-latency-lab command line.
+
+  python -m vlab detect                      what is installed
+  python -m vlab gen-utterances              synthesize the fixed utterance set with macOS `say`
+  python -m vlab run --out results/x         measure (real stages where available)
+  python -m vlab run --fake --out results/x  same loop with fake stages, no models needed
+  python -m vlab report results/x            rebuild summary.md and waterfall.html
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+
+from . import stages
+from .pipeline import MODES, metrics, pct, run_turn
+from .report import summary_table, waterfall_html
+
+ROOT = Path(__file__).resolve().parent.parent
+AUDIO = ROOT / "audio"
+
+
+@dataclass
+class Utt:
+    id: str
+    text: str
+    wav: str | None
+    seconds: float | None
+
+
+def load_utterances() -> list[Utt]:
+    out = []
+    for line in (ROOT / "utterances.txt").read_text().splitlines():
+        if line.strip() and not line.startswith("#"):
+            uid, text = line.split("|", 1)
+            wav = AUDIO / f"{uid}.wav"
+            out.append(Utt(uid, text.strip(), str(wav) if wav.exists() else None,
+                           stages.wav_seconds(str(wav)) if wav.exists() else None))
+    return out
+
+
+def gen_utterances(voice: str):
+    AUDIO.mkdir(exist_ok=True)
+    for u in load_utterances():
+        subprocess.run(["say", "-v", voice, "-o", str(AUDIO / f"{u.id}.wav"), "--file-format=WAVE",
+                        "--data-format=LEI16@16000", u.text], check=True)
+        print(u.id, f"{stages.wav_seconds(str(AUDIO / f'{u.id}.wav')):.2f}s", u.text)
+
+
+def _sh(*argv) -> str:
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def environment(llm, tts, stt) -> dict:
+    env = {"os": f"macOS {platform.mac_ver()[0]}" if sys.platform == "darwin" else platform.platform(),
+           "chip": _sh("sysctl", "-n", "machdep.cpu.brand_string") or platform.machine(),
+           "ram_gb": round(int(_sh("sysctl", "-n", "hw.memsize") or 0) / 2**30) or None,
+           "python": platform.python_version(), "stt": stt.name, "llm": llm.name, "tts": tts.name}
+    if isinstance(llm, stages.OllamaLLM):
+        try:
+            with urllib.request.urlopen(llm.base_url + "/api/version", timeout=5) as r:
+                env["ollama"] = json.load(r)["version"]
+            with urllib.request.urlopen(llm.base_url + "/api/tags", timeout=5) as r:
+                tag = next(m for m in json.load(r)["models"] if m["name"] == llm.model)
+            d = tag["details"]
+            env["model"] = f"{llm.model} ({d['parameter_size']}, {d['quantization_level']}, digest {tag['digest'][:12]})"
+        except (OSError, StopIteration, KeyError, ValueError):
+            pass
+    return env
+
+
+def load_snapshot(llm) -> dict:
+    """Machine load at this moment: other processes sharing the Mac and its Ollama skew latency."""
+    snap = {"loadavg_1m": round(os.getloadavg()[0], 2)}
+    if isinstance(llm, stages.OllamaLLM):
+        try:
+            with urllib.request.urlopen(llm.base_url + "/api/ps", timeout=5) as r:
+                snap["ollama_loaded"] = [m["name"] for m in json.load(r)["models"]]
+        except (OSError, KeyError, ValueError):
+            pass
+    return snap
+
+
+def probe_ttft(llm) -> float:
+    """Time to first token of a tiny request: if a cancelled generation were still running, this would wait."""
+    s = time.perf_counter()
+    stream = llm.stream("Say OK.")
+    for piece in stream:
+        if piece.strip():
+            break
+    t = time.perf_counter() - s
+    stream.close()
+    return t
+
+
+def build_stages(a):
+    if a.fake:
+        return stages.FakeSTT(), stages.FakeLLM(), stages.FakeTTS()
+    found = stages.available()
+    stt = stages.OracleSTT()  # no real STT backend wired in yet; see README "Known limits"
+    tts = stages.SayTTS(a.voice) if found["say"] else stages.FakeTTS()
+    return stt, stages.OllamaLLM(a.model), tts
+
+
+def run(a):
+    stt, llm, tts = build_stages(a)
+    utts = load_utterances()[: a.limit or None]
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    env = environment(llm, tts, stt)
+    env["load_at_start"] = load_snapshot(llm)
+    print(json.dumps(env, indent=1), file=sys.stderr)
+    if not a.fake:  # warm up: cold model load and first `say` call are excluded from the numbers
+        for piece in llm.stream("Hello."):
+            pass
+        tts.synth("Warming up.", threading.Event())
+    turns = []
+    for rep in range(a.reps):
+        for u in utts:  # strategies interleaved per utterance so drift hits all of them alike
+            for mode in MODES:
+                turns.append(dict(run_turn(u, stt, llm, tts, mode), rep=rep))
+            for anchor in ("token", "audio"):
+                t = run_turn(u, stt, llm, tts, "sentence", barge_in_after=a.barge_in_after, barge_in_anchor=anchor)
+                t["probe_ttft_s"] = probe_ttft(llm)
+                turns.append(dict(t, rep=rep))
+            print(f"rep {rep} {u.id}: " + ", ".join(
+                f"{t['mode']} first audio {metrics(t).get('first_audio_s', 0) * 1000:.0f} ms"
+                for t in turns[-5:-2]), file=sys.stderr)
+    with open(out / "turns.jsonl", "w") as f:
+        for t in turns:
+            f.write(json.dumps(t) + "\n")
+    env["load_at_end"] = load_snapshot(llm)
+    (out / "env.json").write_text(json.dumps(dict(env, reps=a.reps, utterances=len(utts),
+                                                  barge_in_after_s=a.barge_in_after), indent=1) + "\n")
+    report(out)
+
+
+def report(out: Path):
+    turns = [json.loads(line) for line in (out / "turns.jsonl").read_text().splitlines()]
+    env = json.loads((out / "env.json").read_text())
+    normal = [metrics(t).get("ttft_s") for t in turns if t["mode"] == "sentence"]
+    probes = [t["probe_ttft_s"] for t in turns if "probe_ttft_s" in t]
+    md = [f"# Results: {out.name}", "", "Times in ms (p50 / p95), RTF = processing time / audio length.", "",
+          "```", json.dumps(env, indent=1), "```", "", summary_table(turns), ""]
+    barge = [metrics(t) for t in turns if "interrupt" in t.get("marks", {})]
+    if barge:
+        md += [f"Barge-ins: {len(barge)}; the LLM was still generating at the interrupt in "
+               f"{sum(m['llm_running_at_interrupt'] for m in barge)} of them. 'cancel LLM' and 'cancel TTS' "
+               f"only count turns where that stage still had work.", ""]
+    if probes:
+        md += [f"After each barge-in a tiny request was sent at once. Its time to first token: "
+               f"p50 {pct(probes, 50) * 1000:.0f} ms / p95 {pct(probes, 95) * 1000:.0f} ms "
+               f"(normal turns: p50 {pct(normal, 50) * 1000:.0f} ms). Similar numbers mean the cancelled "
+               f"generation really stopped instead of running on in the background.", ""]
+    (out / "summary.md").write_text("\n".join(md))
+    first_rep = [t for t in turns if t.get("rep", 0) == 0]
+    (out / "waterfall.html").write_text(waterfall_html(first_rep, f"Voice turn waterfall: {out.name}", env))
+    print("\n".join(md))
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="vlab", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("detect")
+    g = sub.add_parser("gen-utterances")
+    g.add_argument("--voice", default="Samantha")
+    r = sub.add_parser("run")
+    r.add_argument("--out", required=True)
+    r.add_argument("--fake", action="store_true", help="fake stages, no models")
+    r.add_argument("--model", default=os.environ.get("VLAB_MODEL", "qwen3.5:9b"))
+    r.add_argument("--voice", default="Samantha")
+    r.add_argument("--reps", type=int, default=3)
+    r.add_argument("--limit", type=int, default=0, help="only the first N utterances")
+    r.add_argument("--barge-in-after", type=float, default=0.3,
+                   help="seconds after the anchor (first token / first audio chunk) when the user interrupts")
+    rp = sub.add_parser("report")
+    rp.add_argument("out")
+    a = p.parse_args(argv)
+    if a.cmd == "detect":
+        print(json.dumps(stages.available(), indent=1))
+    elif a.cmd == "gen-utterances":
+        gen_utterances(a.voice)
+    elif a.cmd == "run":
+        run(a)
+    else:
+        report(Path(a.out))
+
+
+if __name__ == "__main__":
+    main()
