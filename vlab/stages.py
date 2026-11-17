@@ -137,6 +137,84 @@ class OllamaLLM:
         })
 
 
+class RateLimited(Exception):
+    """Cloud endpoint refused or dropped the request (429, 5xx, disconnect): retry the turn."""
+
+
+class OpenAIStream:
+    """Server-sent events from an OpenAI-compatible /chat/completions endpoint."""
+
+    def __init__(self, url: str, key: str, payload: dict):
+        u = urlparse(url)
+        conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+        self.conn = conn_cls(u.hostname, u.port, timeout=60)
+        try:
+            self.conn.request("POST", u.path, json.dumps(payload),
+                              {"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
+            self.resp = self.conn.getresponse()
+        except (OSError, http.client.HTTPException):  # dropped connection: retryable, like a 429
+            self.conn.close()
+            raise RateLimited
+        if self.resp.status in (429, 500, 503):  # overloaded: the runner retries the turn
+            self.conn.close()
+            raise RateLimited
+        if self.resp.status != 200:
+            raise RuntimeError(f"{u.hostname} {self.resp.status}: {self.resp.read()[:200]!r}")
+        self.stats: dict = {}
+
+    def __iter__(self):
+        try:
+            while True:
+                try:
+                    line = self.resp.readline()
+                except (OSError, ValueError, http.client.HTTPException):
+                    return
+                if not line:
+                    return
+                line = line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                data = line[5:].strip()
+                if data == b"[DONE]":
+                    return
+                d = json.loads(data)
+                if d.get("usage"):
+                    self.stats = {"eval_count": d["usage"].get("completion_tokens"),
+                                  "prompt_eval_count": d["usage"].get("prompt_tokens")}
+                for ch in d.get("choices", []):
+                    piece = (ch.get("delta") or {}).get("content") or ""
+                    if piece:
+                        yield piece
+        finally:
+            self.conn.close()
+
+    def close(self):
+        try:
+            self.conn.sock.shutdown(socket.SHUT_RDWR)
+        except (OSError, AttributeError):
+            pass
+
+
+class GeminiLLM:
+    """Optional cloud LLM for comparison: Gemini through its OpenAI-compatible endpoint.
+    Needs GEMINI_API_KEY in the environment; nothing else in the repo uses a key."""
+
+    URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+
+    def __init__(self, model="gemini-3.5-flash-lite", max_tokens=120):
+        self.key = os.environ.get("GEMINI_API_KEY")
+        if not self.key:
+            raise RuntimeError("GEMINI_API_KEY is not set")
+        self.model, self.max_tokens, self.name = model, max_tokens, f"gemini {model} (cloud)"
+
+    def stream(self, text: str) -> OpenAIStream:
+        return OpenAIStream(self.URL, self.key, {
+            "model": self.model, "stream": True, "reasoning_effort": "minimal", "temperature": 0,
+            "max_tokens": self.max_tokens, "stream_options": {"include_usage": True},
+            "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": text}],
+        })
+
+
 # ---------------------------------------------------------------- TTS
 
 class FakeTTS:

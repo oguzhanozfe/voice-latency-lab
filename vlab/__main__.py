@@ -123,7 +123,10 @@ def load_snapshot(llm) -> dict:
 def probe_ttft(llm) -> float:
     """Time to first token of a tiny request: if a cancelled generation were still running, this would wait."""
     s = time.perf_counter()
-    stream = llm.stream("Say OK.")
+    try:
+        stream = llm.stream("Say OK.")
+    except stages.RateLimited:
+        return None
     for piece in stream:
         if piece.strip():
             break
@@ -150,7 +153,20 @@ def build_stages(a):
             print(f"skipping TTS {name!r}: not installed", file=sys.stderr)
     if not ttss:
         sys.exit("no TTS available")
-    return stt, stages.OllamaLLM(a.model), ttss
+    llm = stages.GeminiLLM() if a.llm == "gemini" else stages.OllamaLLM(a.model)
+    return stt, llm, ttss
+
+
+def turn_with_retry(*args, **kw):
+    """Free-tier cloud APIs answer 429 under load: wait and rerun the whole turn, so backoff never
+    lands inside a measured time."""
+    for wait in (5, 15, 30, 60, 60, 60):
+        try:
+            return run_turn(*args, **kw)
+        except stages.RateLimited:
+            print(f"rate limited, retrying in {wait}s", file=sys.stderr)
+            time.sleep(wait)
+    return None  # gave up: the turn is skipped and counted in env.json
 
 
 def run(a):
@@ -170,17 +186,23 @@ def run(a):
             tts.synth("Warming up.", threading.Event())
         if utts:
             stt.transcribe(utts[0])
-    turns = []
+    turns, skipped = [], 0
     for rep in range(a.reps):
         for u in utts:  # strategies (and voices) interleaved per utterance so drift hits all alike
             for tts in ttss:
                 label = (lambda m: f"{tts.name.split()[0]} · {m}") if len(ttss) > 1 else (lambda m: m)
                 for mode in MODES:
-                    t = run_turn(u, stt, llm, tts, mode)
+                    t = turn_with_retry(u, stt, llm, tts, mode)
+                    if t is None:
+                        skipped += 1
+                        continue
                     turns.append(dict(t, mode=label(t["mode"]), rep=rep, loadavg_1m=round(os.getloadavg()[0], 2)))
                 for anchor in ("token", "audio"):
-                    t = run_turn(u, stt, llm, tts, "sentence", barge_in_after=a.barge_in_after,
-                                 barge_in_anchor=anchor)
+                    t = turn_with_retry(u, stt, llm, tts, "sentence", barge_in_after=a.barge_in_after,
+                                        barge_in_anchor=anchor)
+                    if t is None:
+                        skipped += 1
+                        continue
                     t["probe_ttft_s"] = probe_ttft(llm)
                     turns.append(dict(t, mode=label(t["mode"]), rep=rep, loadavg_1m=round(os.getloadavg()[0], 2)))
                 print(f"rep {rep} {u.id}: " + ", ".join(
@@ -191,7 +213,7 @@ def run(a):
             f.write(json.dumps(t) + "\n")
     env["load_at_end"] = load_snapshot(llm)
     (out / "env.json").write_text(json.dumps(dict(env, reps=a.reps, utterances=len(utts),
-                                                  barge_in_after_s=a.barge_in_after), indent=1) + "\n")
+                                                  barge_in_after_s=a.barge_in_after, skipped_turns=skipped), indent=1) + "\n")
     report(out)
 
 
@@ -200,7 +222,7 @@ def report(out: Path):
     env = json.loads((out / "env.json").read_text())
     normal = [metrics(t).get("ttft_s") for t in turns
               if t["mode"].endswith("sentence") and "interrupt" not in t.get("marks", {})]
-    probes = [t["probe_ttft_s"] for t in turns if "probe_ttft_s" in t]
+    probes = [t["probe_ttft_s"] for t in turns if t.get("probe_ttft_s") is not None]
     md = [f"# Results: {out.name}", "", "Times in ms (p50 / p95), RTF = processing time / audio length.", "",
           "```", json.dumps(env, indent=1), "```", "", summary_table(turns), ""]
     barge = [metrics(t) for t in turns if "interrupt" in t.get("marks", {})]
@@ -228,6 +250,8 @@ def main(argv=None):
     r = sub.add_parser("run")
     r.add_argument("--out", required=True)
     r.add_argument("--fake", action="store_true", help="fake stages, no models")
+    r.add_argument("--llm", default="ollama", choices=["ollama", "gemini"],
+                   help="gemini needs GEMINI_API_KEY; it is the only stage that leaves the machine")
     r.add_argument("--model", default=os.environ.get("VLAB_MODEL", "qwen3.5:9b"))
     r.add_argument("--voice", default="Samantha", help="macOS say voice")
     r.add_argument("--stt", default="auto", choices=["auto", "faster-whisper", "oracle"])
