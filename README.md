@@ -20,7 +20,7 @@ open demo-out/waterfall.html
 
 - **Ollama running with `qwen3.5:9b`** (or `--model`, `OLLAMA_URL`) and a TTS (Piper or macOS `say`): a live local run. faster-whisper is used too if it and the generated audio are present.
 - **Otherwise fake stages**, so it never fails for lack of a model; the timings are then synthetic and labelled `mode: fake stages`.
-- **Gemini** only on request, `--llm gemini`, and only if `GEMINI_API_KEY` is set. It is the only stage that leaves the machine.
+- **Cloud, only on request and only with your own key:** `--llm groq` (needs `GROQ_API_KEY`; Groq does the speech to text too) or `--llm gemini` (needs `GEMINI_API_KEY`). These are the only stages that leave the machine.
 
 The full measurement is `python3 -m vlab run`, described under [Run it](#run-it).
 
@@ -63,7 +63,9 @@ Playback is simulated from each chunk's audio length (chunk *i* starts at the la
 | stage | backends | notes |
 |---|---|---|
 | STT | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) `base.en`, int8 on CPU, beam 1 (optional) | model loaded once; WER against the known text is reported so a fast but wrong transcript shows up. Without it, the known transcript is used and STT is reported as **not measured** |
+| STT | Groq `whisper-large-v3-turbo`, cloud (optional, `--stt groq`, `GROQ_API_KEY`) | time includes uploading the WAV |
 | LLM | Ollama, streaming `/api/chat`, `think: false`, temperature 0, fixed seed, max 120 tokens | `--model`, `OLLAMA_URL` |
+| LLM | Groq `qwen/qwen3.8-27b` or Gemini, cloud, streaming OpenAI-compatible API (optional, `--llm groq` / `--llm gemini`) | key from `GROQ_API_KEY` / `GEMINI_API_KEY` only |
 | TTS | macOS `say` | a new process per chunk that writes a WAV file; killed on barge-in |
 | TTS | [Piper](https://github.com/OHF-Voice/piper1-gpl) `en_US-lessac-medium`, in-process (optional) | voice loaded once; cannot be interrupted mid-inference, so cancel waits for the current Piper sentence |
 | all | fake stages (`--fake`) | used by the tests and CI |
@@ -141,6 +143,22 @@ Run [`results/m5pro-gemini-3.5-flash-lite`](results/m5pro-gemini-3.5-flash-lite)
 
 On this setup the local 9B model starts answering about 1.2 s sooner at the median, and its worst cases are far less extreme. The cloud numbers depend on free-tier queueing and the network on this day, not just on the model, so read them as one sample. Its LLM had already finished in 21 of the 24 barge-ins. A likely reason is that Gemini streams in a few large pieces: one response checked by hand arrived in three. The run files do not record piece counts.
 
+### Cloud pipeline: Groq speech to text and LLM, local Piper
+
+Run [`results/m5pro-groq-cloud-pipeline`](results/m5pro-groq-cloud-pipeline) sends both the recording and the LLM call to Groq (free tier): `whisper-large-v3-turbo` for speech to text and `qwen/qwen3.8-27b` with reasoning off, max 120 tokens. Piper synthesizes locally. It is a small run: utterances u01–u04 × 5 turn types × 1 repetition = **20 turns**, none skipped.
+
+**Network:** the Mac was on Wi-Fi. A TCP connect to `api.groq.com` took 44.4 ms (median of 5) at the start and 43.5 ms at the end. Every request opens a new TLS connection, and that setup is inside the measured times; a client that kept connections open would be somewhat faster. The 1-minute load average was 4.3–5.0.
+
+| | STT p50 | first token p50 | speech end to first audio p50: full / sentence / clause |
+|---|---|---|---|
+| local: faster-whisper `base.en` + `qwen3.5:9b` + Piper (36 turns per row) | 252–268 ms | 59–151 ms | 1629 / 800 / 771 ms |
+| cloud: Groq whisper + Groq `qwen3.8-27b` + Piper (4 turns per row) | 428–467 ms | 205–339 ms | 825 / 859 / 868 ms |
+
+- **Streaming stops mattering.** Groq writes the whole reply so fast that waiting for all of it (825 ms) is no slower than sending the first sentence (859 ms). In all 8 barge-ins the LLM had already finished.
+- **The cloud loses on the parts before the LLM.** Uploading and transcribing takes about 0.2 s longer than local `base.en` (STT real-time factor 0.14 against 0.08), and the first token comes about 0.2 s later. The larger Whisper model got every word right, but so did the local one on these four questions.
+- **So it is close.** With sentence streaming, local is 800 ms and the cloud pipeline 859 ms at the median. Without streaming the cloud wins clearly, 825 against 1629 ms.
+- **Read it as one sample.** It is only 4 of the 12 questions, on one Wi-Fi link at one time of day, and the free tier's queue time varies.
+
 A confound to know about: Ollama caches the prompt prefix, and the turns for one utterance run back to back. A turn that repeats the previous turn's prompt gets its first token in 68 ms (p50, 216 turns). A turn that follows a probe or a new utterance takes 150 ms (144 turns). The "full" turns and the "barge-in after first audio" turns always follow a probe or a new utterance, so they pay about 80 ms more. That is small next to the 700–800 ms streaming gain, but the gaps between rows are slightly inflated by it.
 
 ## Known limits
@@ -152,6 +170,7 @@ A confound to know about: Ollama caches the prompt prefix, and the turns for one
 - **Prompt cache.** Turns for one utterance share a cached prompt (see Results). Shuffling the order or adding a per-turn nonce would remove that.
 - **CPU load is not GPU load.** The recorded load average does not see another process using Ollama on the GPU. The contended stretch shows up in time to first token, not in the load column.
 - **Regex chunking.** Sentence and clause boundaries are found with a regex; abbreviations such as "Dr. Smith" split early.
+- **Cloud runs are single samples.** The Gemini and Groq rows depend on the network and the free tier's queue on the day they ran.
 - **One model, one voice, one machine.** The numbers say nothing about other hardware.
 
 ## License

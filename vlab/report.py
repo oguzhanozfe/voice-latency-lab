@@ -121,8 +121,11 @@ def index_html(runs: list[tuple[str, dict, str]], repo: str) -> str:
     secs = []
     for name, env, table in runs:
         llm = env.get("llm", "")
+        net = (env.get("load_at_start") or {}).get("network")
+        net_txt = (f" · network: {net['link']}, TCP connect to {net['host']} {net['tcp_connect_ms_p50']} ms"
+                   if net else "")
         secs.append(f'<h2>{html.escape(name)}</h2><p class="meta">{html.escape(str(env.get("chip", "")))} · '
-                    f'LLM {html.escape(str(llm))} · {env.get("reps")} reps × {env.get("utterances")} utterances · '
+                    f'STT {html.escape(str(env.get("stt", "")))} · LLM {html.escape(str(llm))}{html.escape(net_txt)} · {env.get("reps")} reps × {env.get("utterances")} utterances · '
                     f'<a href="{name}/waterfall.html">waterfall (first rep)</a> · '
                     f'<a href="{repo}/blob/main/results/{name}/summary.md">summary.md</a> · '
                     f'<a href="{repo}/tree/main/results/{name}">raw turns.jsonl + env.json</a></p>'

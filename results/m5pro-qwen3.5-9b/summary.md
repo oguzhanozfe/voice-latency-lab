@@ -61,7 +61,7 @@ Times in ms (p50 / p95), RTF = processing time / audio length.
 
 Barge-ins: 144; the LLM was still generating at the interrupt in 102 of them. 'cancel LLM' and 'cancel TTS' only count turns where that stage still had work.
 
-After each barge-in a tiny request was sent at once. Its time to first token: p50 169 ms / p95 4801 ms (normal turns: p50 70 ms). Similar numbers are consistent with the cancelled generation having stopped (a probe alone cannot prove it if Ollama runs parallel slots).
+After each barge-in a tiny request was sent at once. Its time to first token: p50 169 ms / p95 4801 ms (normal turns: p50 70 ms). Similar numbers are consistent with the cancelled generation having stopped (a probe alone cannot prove it if the server runs requests in parallel).
 
 ## Run-level checks
 

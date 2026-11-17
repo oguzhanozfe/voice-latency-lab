@@ -215,6 +215,62 @@ class GeminiLLM:
         })
 
 
+GROQ = "https://api.groq.com/openai/v1"
+
+
+def _groq_key() -> str:
+    key = os.environ.get("GROQ_API_KEY")
+    if not key:
+        raise RuntimeError("GROQ_API_KEY is not set")
+    return key
+
+
+class GroqLLM:
+    """Optional cloud LLM: Groq's OpenAI-compatible endpoint. Needs GROQ_API_KEY in the environment."""
+
+    def __init__(self, model="qwen/qwen3.8-27b", max_tokens=120):
+        self.key, self.model, self.max_tokens, self.name = _groq_key(), model, max_tokens, f"groq {model} (cloud)"
+
+    def stream(self, text: str) -> OpenAIStream:
+        return OpenAIStream(GROQ + "/chat/completions", self.key, {
+            "model": self.model, "stream": True, "reasoning_effort": "none", "temperature": 0, "seed": 7,
+            "max_tokens": self.max_tokens, "stream_options": {"include_usage": True},
+            "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": text}],
+        })
+
+
+class GroqSTT:
+    """Optional cloud STT: Groq whisper-large-v3-turbo. The time includes uploading the WAV."""
+    measured = True
+
+    def __init__(self, model="whisper-large-v3-turbo"):
+        self.key, self.model, self.name = _groq_key(), model, f"groq {model} (cloud)"
+
+    def transcribe(self, utt) -> str:
+        boundary = "vlab" + os.urandom(8).hex()
+        fields = {"model": self.model, "language": "en", "temperature": "0", "response_format": "text"}
+        body = b"".join(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+                        for k, v in fields.items())
+        with open(utt.wav, "rb") as f:
+            body += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.wav"\r\n'
+                     f'Content-Type: audio/wav\r\n\r\n').encode() + f.read() + f"\r\n--{boundary}--\r\n".encode()
+        conn = http.client.HTTPSConnection("api.groq.com", timeout=60)
+        try:
+            conn.request("POST", "/openai/v1/audio/transcriptions", body,
+                         {"Authorization": f"Bearer {self.key}", "Content-Type": f"multipart/form-data; boundary={boundary}"})
+            r = conn.getresponse()
+            data = r.read()
+        except (OSError, http.client.HTTPException):
+            raise RateLimited
+        finally:
+            conn.close()
+        if r.status in (429, 500, 503):
+            raise RateLimited
+        if r.status != 200:
+            raise RuntimeError(f"groq stt {r.status}: {data[:200]!r}")
+        return data.decode().strip()
+
+
 # ---------------------------------------------------------------- TTS
 
 class FakeTTS:

@@ -111,9 +111,30 @@ def environment(llm, ttss, stt) -> dict:
     return env
 
 
+def network_snapshot(host: str) -> dict:
+    """How far away the cloud is right now: TCP connect time (about one round trip), median of 5,
+    and whether the default route is Wi-Fi or wired. No addresses are recorded."""
+    import socket
+    rtts = []
+    for _ in range(5):
+        s = time.perf_counter()
+        try:
+            socket.create_connection((host, 443), timeout=5).close()
+            rtts.append(time.perf_counter() - s)
+        except OSError:
+            pass
+    iface = next((ln.split(":")[1].strip() for ln in _sh("route", "-n", "get", "default").splitlines()
+                  if "interface:" in ln), "")
+    ports = _sh("networksetup", "-listallhardwareports").split("Hardware Port: ")
+    kind = next((b.splitlines()[0] for b in ports if f"Device: {iface}" in b), iface or "unknown")
+    return {"host": host, "tcp_connect_ms_p50": round(pct(rtts, 50) * 1000, 1) if rtts else None, "link": kind}
+
+
 def load_snapshot(llm) -> dict:
     """Machine load at this moment: other processes sharing the Mac and its Ollama skew latency."""
     snap = {"loadavg_1m": round(os.getloadavg()[0], 2)}
+    if isinstance(llm, stages.GroqLLM):
+        snap["network"] = network_snapshot("api.groq.com")
     if isinstance(llm, stages.OllamaLLM):
         try:
             with urllib.request.urlopen(llm.base_url + "/api/ps", timeout=5) as r:
@@ -142,7 +163,9 @@ def build_stages(a):
     if a.fake:
         return stages.FakeSTT(), stages.FakeLLM(), [stages.FakeTTS()]
     found = stages.available()
-    if a.stt == "faster-whisper" or (a.stt == "auto" and found["faster-whisper"]):
+    if a.stt == "groq":
+        stt = stages.GroqSTT()
+    elif a.stt == "faster-whisper" or (a.stt == "auto" and found["faster-whisper"]):
         stt = stages.FasterWhisperSTT(device=a.stt_device, compute_type="int8" if a.stt_device == "cpu" else "float16")
     else:
         stt = stages.OracleSTT()
@@ -156,7 +179,8 @@ def build_stages(a):
             print(f"skipping TTS {name!r}: not installed", file=sys.stderr)
     if not ttss:
         sys.exit("no TTS available")
-    llm = stages.GeminiLLM() if a.llm == "gemini" else stages.OllamaLLM(a.model)
+    llm = {"gemini": lambda: stages.GeminiLLM(), "groq": lambda: stages.GroqLLM(a.groq_model),
+           "ollama": lambda: stages.OllamaLLM(a.model)}[a.llm]()
     return stt, llm, ttss
 
 
@@ -273,7 +297,7 @@ def report(out: Path, quiet: bool = False):
         md += [f"After each barge-in a tiny request was sent at once. Its time to first token: "
                f"p50 {pct(probes, 50) * 1000:.0f} ms / p95 {pct(probes, 95) * 1000:.0f} ms "
                f"(normal turns: p50 {pct(normal, 50) * 1000:.0f} ms). Similar numbers are consistent with "
-               f"the cancelled generation having stopped (a probe alone cannot prove it if Ollama runs parallel slots).", ""]
+               f"the cancelled generation having stopped (a probe alone cannot prove it if the server runs requests in parallel).", ""]
     md += extra_stats(turns)
     (out / "summary.md").write_text("\n".join(md))
     first_rep = [t for t in turns if t.get("rep", 0) == 0]
@@ -295,7 +319,7 @@ def build_site(docs: Path):
         turns = [json.loads(line) for line in (out / "turns.jsonl").read_text().splitlines()]
         runs.append((out.name, json.loads((out / "env.json").read_text()), summary_table(turns)))
     (docs / "index.html").write_text(index_html(runs, REPO))
-    print(f"rebuilt {docs / 'index.html'} from {len(runs)} committed runs: " + ", ".join(r[0] for r in runs))
+    print(f"rebuilt docs/index.html from {len(runs)} committed runs: " + ", ".join(r[0] for r in runs))
 
 
 def ollama_has(model: str) -> bool:
@@ -312,14 +336,15 @@ def demo(a):
     found = stages.available()
     tts = next((n for n in ("piper", "say") if found[n]), None)
     if a.fake or tts is None or (a.llm == "ollama" and not ollama_has(a.model)) \
-            or (a.llm == "gemini" and not os.environ.get("GEMINI_API_KEY")):
-        mode, fake = "fake stages (no Ollama/TTS found, or --fake): timings are synthetic", True
+            or (a.llm != "ollama" and not os.environ.get(f"{a.llm.upper()}_API_KEY")):
+        mode, fake = "fake stages (no Ollama/TTS/key found, or --fake): timings are synthetic", True
     else:
-        mode, fake = f"live: {a.llm} {a.model if a.llm == 'ollama' else ''}, TTS {tts}", False
+        mode, fake = f"live: {a.llm} {a.model if a.llm == 'ollama' else '(cloud)'}, TTS {tts}", False
     has_audio = all(u.wav for u in load_utterances()[:3])
-    stt = "faster-whisper" if found["faster-whisper"] and has_audio else "oracle"
+    stt = ("groq" if a.llm == "groq" else "faster-whisper" if found["faster-whisper"] else "oracle") \
+        if has_audio else "oracle"
     print(f"mode: {mode}", file=sys.stderr)
-    run(argparse.Namespace(out=a.out, fake=fake, llm=a.llm, model=a.model, voice="Samantha", stt=stt,
+    run(argparse.Namespace(out=a.out, fake=fake, llm=a.llm, model=a.model, groq_model="qwen/qwen3.8-27b", voice="Samantha", stt=stt,
                            stt_device="cpu", tts=tts or "say", reps=1, limit=3, barge_in_after=0.3))
     print(f"\nmode: {mode}\nopen {a.out}/waterfall.html  (published runs: docs/index.html)")
 
@@ -333,11 +358,13 @@ def main(argv=None):
     r = sub.add_parser("run")
     r.add_argument("--out", required=True)
     r.add_argument("--fake", action="store_true", help="fake stages, no models")
-    r.add_argument("--llm", default="ollama", choices=["ollama", "gemini"],
-                   help="gemini needs GEMINI_API_KEY; it is the only stage that leaves the machine")
+    r.add_argument("--llm", default="ollama", choices=["ollama", "gemini", "groq"],
+                   help="gemini / groq need GEMINI_API_KEY / GROQ_API_KEY and leave the machine")
+    r.add_argument("--groq-model", default="qwen/qwen3.8-27b")
     r.add_argument("--model", default=os.environ.get("VLAB_MODEL", "qwen3.5:9b"))
     r.add_argument("--voice", default="Samantha", help="macOS say voice")
-    r.add_argument("--stt", default="auto", choices=["auto", "faster-whisper", "oracle"])
+    r.add_argument("--stt", default="auto", choices=["auto", "faster-whisper", "oracle", "groq"],
+                   help="groq = whisper-large-v3-turbo in the cloud, needs GROQ_API_KEY")
     r.add_argument("--stt-device", default="cpu", choices=["cpu", "mps"])
     r.add_argument("--tts", default="say,piper", help="comma list of: say, piper (missing ones are skipped)")
     r.add_argument("--reps", type=int, default=3)
@@ -347,7 +374,8 @@ def main(argv=None):
     d = sub.add_parser("demo", help="no keys needed")
     d.add_argument("--out", default="demo-out")
     d.add_argument("--fake", action="store_true", help="force fake stages")
-    d.add_argument("--llm", default="ollama", choices=["ollama", "gemini"], help="gemini only if GEMINI_API_KEY is set")
+    d.add_argument("--llm", default="ollama", choices=["ollama", "gemini", "groq"],
+                   help="cloud LLMs only if GEMINI_API_KEY / GROQ_API_KEY is set; groq also does STT")
     d.add_argument("--model", default=os.environ.get("VLAB_MODEL", "qwen3.5:9b"))
     rp = sub.add_parser("report")
     rp.add_argument("out")
