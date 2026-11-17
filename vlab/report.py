@@ -8,7 +8,7 @@ from .pipeline import metrics, pct
 COLUMNS = [  # (metric, header)
     ("stt_s", "STT"), ("ttft_s", "first token"), ("first_audio_s", "first audio"),
     ("e2e_first_audio_s", "e2e first audio"), ("gap_s", "mid-reply gaps"),
-    ("turn_total_s", "turn total"), ("tts_rtf", "TTS RTF"), ("stt_rtf", "STT RTF"),
+    ("turn_total_s", "turn total"), ("tts_rtf", "TTS RTF"), ("stt_rtf", "STT RTF"), ("stt_wer", "STT WER"),
     ("cancel_s", "cancel"), ("cancel_llm_s", "cancel LLM"), ("cancel_tts_s", "cancel TTS"),
 ]
 
@@ -16,7 +16,7 @@ COLUMNS = [  # (metric, header)
 def _fmt(v, metric):
     if v is None:
         return "–"
-    return f"{v:.2f}" if "rtf" in metric else f"{v * 1000:.0f}"
+    return f"{v:.2f}" if "rtf" in metric or "wer" in metric else f"{v * 1000:.0f}"
 
 
 def summary_table(turns: list[dict]) -> str:

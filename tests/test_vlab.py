@@ -183,5 +183,13 @@ class CliTests(unittest.TestCase):
             self.assertEqual(len(turns), 10)  # 2 utterances x (3 modes + 2 barge-in anchors)
 
 
+class WerTests(unittest.TestCase):
+    def test_wer(self):
+        from vlab.stages import word_error_rate
+        self.assertEqual(word_error_rate("Where is my order?", "where is my order"), 0.0)
+        self.assertAlmostEqual(word_error_rate("where is my order", "where is the order"), 0.25)
+        self.assertAlmostEqual(word_error_rate("a b", ""), 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()

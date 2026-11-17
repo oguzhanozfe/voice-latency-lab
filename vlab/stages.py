@@ -202,12 +202,75 @@ class SayTTS(_SubprocessTTS):
 
 def available() -> dict:
     """What is installed here. Nothing is installed by this tool."""
-    found = {"say": bool(shutil.which("say")),
-             "piper": bool(shutil.which("piper")),
-             "whisper-cli": bool(shutil.which("whisper-cli"))}
-    try:
-        import faster_whisper  # noqa: F401
-        found["faster-whisper"] = True
-    except ImportError:
-        found["faster-whisper"] = False
-    return found
+    import importlib.util
+    return {"say": bool(shutil.which("say")),
+            "piper": importlib.util.find_spec("piper") is not None
+            and os.path.exists("models/piper/en_US-lessac-medium.onnx"),
+            "faster-whisper": importlib.util.find_spec("faster_whisper") is not None}
+
+
+# ---------------------------------------------------------------- optional extras (pip install faster-whisper piper-tts)
+
+def _read_wav_float(path: str):
+    import numpy as np  # comes with faster-whisper
+    with wave.open(path) as w:
+        if w.getframerate() != 16000 or w.getnchannels() != 1:
+            raise ValueError(f"{path}: need 16 kHz mono (python -m vlab gen-utterances makes that)")
+        return np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32) / 32768
+
+
+class FasterWhisperSTT:
+    """faster-whisper, model loaded once (load time is not part of a turn). WAV decoded with `wave`."""
+    measured = True
+
+    def __init__(self, model="base.en", device="cpu", compute_type="int8", download_root="models/whisper"):
+        from faster_whisper import WhisperModel
+        self.model = WhisperModel(model, device=device, compute_type=compute_type, download_root=download_root)
+        self.name = f"faster-whisper {model} ({device}, {compute_type}, beam 1)"
+        self.model_dir = download_root
+
+    def transcribe(self, utt) -> str:
+        segments, _ = self.model.transcribe(_read_wav_float(utt.wav), beam_size=1, language="en")
+        return "".join(s.text for s in segments).strip()
+
+
+class PiperTTS:
+    """Piper in-process: the voice stays loaded, so a call costs only inference.
+    It cannot be killed mid-inference; cancel is checked between Piper's own sentence chunks."""
+
+    def __init__(self, model_path="models/piper/en_US-lessac-medium.onnx"):
+        import piper
+        from piper import PiperVoice
+        data = os.path.join(os.path.dirname(piper.__file__), "espeak-ng-data")
+        if " " in data:  # espeak-ng cannot open a data path containing spaces
+            link = os.path.join(tempfile.mkdtemp(prefix="vlab-espeak-"), "espeak-ng-data")
+            os.symlink(data, link)
+            data = link
+        self.voice = PiperVoice.load(model_path, espeak_data_dir=data)
+        self.model_path = model_path
+        self.name = f"piper {os.path.basename(model_path)} (in-process)"
+
+    def synth(self, text: str, cancel: threading.Event) -> float:
+        samples, rate = 0, 22050
+        for chunk in self.voice.synthesize(text):
+            if cancel.is_set():
+                raise Cancelled
+            samples += len(chunk.audio_int16_bytes) // 2
+            rate = chunk.sample_rate
+        return samples / rate
+
+    def kill(self):
+        pass
+
+
+def word_error_rate(ref: str, hyp: str) -> float:
+    """Word-level edit distance / reference length, case and punctuation ignored."""
+    norm = lambda s: "".join(c.lower() if c.isalnum() or c in " '" else " " for c in s).split()  # noqa: E731
+    r, h = norm(ref), norm(hyp)
+    prev = list(range(len(h) + 1))
+    for i, rw in enumerate(r, 1):
+        cur = [i]
+        for j, hw in enumerate(h, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (rw != hw)))
+        prev = cur
+    return prev[-1] / max(1, len(r))

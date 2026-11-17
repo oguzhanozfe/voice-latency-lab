@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -62,11 +64,37 @@ def _sh(*argv) -> str:
         return ""
 
 
-def environment(llm, tts, stt) -> dict:
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def environment(llm, ttss, stt) -> dict:
     env = {"os": f"macOS {platform.mac_ver()[0]}" if sys.platform == "darwin" else platform.platform(),
            "chip": _sh("sysctl", "-n", "machdep.cpu.brand_string") or platform.machine(),
            "ram_gb": round(int(_sh("sysctl", "-n", "hw.memsize") or 0) / 2**30) or None,
-           "python": platform.python_version(), "stt": stt.name, "llm": llm.name, "tts": tts.name}
+           "python": platform.python_version(), "stt": stt.name, "llm": llm.name,
+           "tts": [t.name for t in ttss]}
+    pkgs = {}
+    for pkg in ("faster-whisper", "ctranslate2", "piper-tts", "onnxruntime"):
+        try:
+            pkgs[pkg] = importlib.metadata.version(pkg)
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    if pkgs:
+        env["packages"] = pkgs
+    files = []
+    if isinstance(stt, stages.FasterWhisperSTT):
+        files += [p for p in Path(stt.model_dir).rglob("model.bin")]
+    files += [Path(t.model_path) for t in ttss if isinstance(t, stages.PiperTTS)]
+    if files:
+        env["model_files_sha256"] = {("whisper " if p.name == "model.bin" else "piper ") + p.name: _sha256(p)
+                                     for p in files}
+    if any(isinstance(t, stages.SayTTS) for t in ttss):
+        env["say_voice"] = next(t.voice for t in ttss if isinstance(t, stages.SayTTS))
     if isinstance(llm, stages.OllamaLLM):
         try:
             with urllib.request.urlopen(llm.base_url + "/api/version", timeout=5) as r:
@@ -106,37 +134,58 @@ def probe_ttft(llm) -> float:
 
 def build_stages(a):
     if a.fake:
-        return stages.FakeSTT(), stages.FakeLLM(), stages.FakeTTS()
+        return stages.FakeSTT(), stages.FakeLLM(), [stages.FakeTTS()]
     found = stages.available()
-    stt = stages.OracleSTT()  # no real STT backend wired in yet; see README "Known limits"
-    tts = stages.SayTTS(a.voice) if found["say"] else stages.FakeTTS()
-    return stt, stages.OllamaLLM(a.model), tts
+    if a.stt == "faster-whisper" or (a.stt == "auto" and found["faster-whisper"]):
+        stt = stages.FasterWhisperSTT(device=a.stt_device, compute_type="int8" if a.stt_device == "cpu" else "float16")
+    else:
+        stt = stages.OracleSTT()
+    ttss = []
+    for name in a.tts.split(","):
+        if name == "say" and found["say"]:
+            ttss.append(stages.SayTTS(a.voice))
+        elif name == "piper" and found["piper"]:
+            ttss.append(stages.PiperTTS())
+        else:
+            print(f"skipping TTS {name!r}: not installed", file=sys.stderr)
+    if not ttss:
+        sys.exit("no TTS available")
+    return stt, stages.OllamaLLM(a.model), ttss
 
 
 def run(a):
-    stt, llm, tts = build_stages(a)
+    stt, llm, ttss = build_stages(a)
     utts = load_utterances()[: a.limit or None]
+    if not isinstance(stt, stages.OracleSTT) and not a.fake and any(u.wav is None for u in utts):
+        sys.exit("audio missing: run `python -m vlab gen-utterances` first")
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    env = environment(llm, tts, stt)
+    env = environment(llm, ttss, stt)
     env["load_at_start"] = load_snapshot(llm)
     print(json.dumps(env, indent=1), file=sys.stderr)
-    if not a.fake:  # warm up: cold model load and first `say` call are excluded from the numbers
+    if not a.fake:  # warm up: cold model loads and first calls are excluded from the numbers
         for piece in llm.stream("Hello."):
             pass
-        tts.synth("Warming up.", threading.Event())
+        for tts in ttss:
+            tts.synth("Warming up.", threading.Event())
+        if utts:
+            stt.transcribe(utts[0])
     turns = []
     for rep in range(a.reps):
-        for u in utts:  # strategies interleaved per utterance so drift hits all of them alike
-            for mode in MODES:
-                turns.append(dict(run_turn(u, stt, llm, tts, mode), rep=rep))
-            for anchor in ("token", "audio"):
-                t = run_turn(u, stt, llm, tts, "sentence", barge_in_after=a.barge_in_after, barge_in_anchor=anchor)
-                t["probe_ttft_s"] = probe_ttft(llm)
-                turns.append(dict(t, rep=rep))
-            print(f"rep {rep} {u.id}: " + ", ".join(
-                f"{t['mode']} first audio {metrics(t).get('first_audio_s', 0) * 1000:.0f} ms"
-                for t in turns[-5:-2]), file=sys.stderr)
+        for u in utts:  # strategies (and voices) interleaved per utterance so drift hits all alike
+            for tts in ttss:
+                label = (lambda m: f"{tts.name.split()[0]} · {m}") if len(ttss) > 1 else (lambda m: m)
+                for mode in MODES:
+                    t = run_turn(u, stt, llm, tts, mode)
+                    turns.append(dict(t, mode=label(t["mode"]), rep=rep, loadavg_1m=round(os.getloadavg()[0], 2)))
+                for anchor in ("token", "audio"):
+                    t = run_turn(u, stt, llm, tts, "sentence", barge_in_after=a.barge_in_after,
+                                 barge_in_anchor=anchor)
+                    t["probe_ttft_s"] = probe_ttft(llm)
+                    turns.append(dict(t, mode=label(t["mode"]), rep=rep, loadavg_1m=round(os.getloadavg()[0], 2)))
+                print(f"rep {rep} {u.id}: " + ", ".join(
+                    f"{t['mode']} first audio {metrics(t).get('first_audio_s', 0) * 1000:.0f} ms"
+                    for t in turns[-5:-2]), file=sys.stderr)
     with open(out / "turns.jsonl", "w") as f:
         for t in turns:
             f.write(json.dumps(t) + "\n")
@@ -149,7 +198,8 @@ def run(a):
 def report(out: Path):
     turns = [json.loads(line) for line in (out / "turns.jsonl").read_text().splitlines()]
     env = json.loads((out / "env.json").read_text())
-    normal = [metrics(t).get("ttft_s") for t in turns if t["mode"] == "sentence"]
+    normal = [metrics(t).get("ttft_s") for t in turns
+              if t["mode"].endswith("sentence") and "interrupt" not in t.get("marks", {})]
     probes = [t["probe_ttft_s"] for t in turns if "probe_ttft_s" in t]
     md = [f"# Results: {out.name}", "", "Times in ms (p50 / p95), RTF = processing time / audio length.", "",
           "```", json.dumps(env, indent=1), "```", "", summary_table(turns), ""]
@@ -179,7 +229,10 @@ def main(argv=None):
     r.add_argument("--out", required=True)
     r.add_argument("--fake", action="store_true", help="fake stages, no models")
     r.add_argument("--model", default=os.environ.get("VLAB_MODEL", "qwen3.5:9b"))
-    r.add_argument("--voice", default="Samantha")
+    r.add_argument("--voice", default="Samantha", help="macOS say voice")
+    r.add_argument("--stt", default="auto", choices=["auto", "faster-whisper", "oracle"])
+    r.add_argument("--stt-device", default="cpu", choices=["cpu", "mps"])
+    r.add_argument("--tts", default="say,piper", help="comma list of: say, piper (missing ones are skipped)")
     r.add_argument("--reps", type=int, default=3)
     r.add_argument("--limit", type=int, default=0, help="only the first N utterances")
     r.add_argument("--barge-in-after", type=float, default=0.3,

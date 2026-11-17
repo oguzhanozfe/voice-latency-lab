@@ -4,7 +4,7 @@ Measures where the time goes in a local voice-agent turn (speech to text → LLM
 
 It is the measurement companion to [voice-support-agent](https://github.com/oguzhanozfe/voice-support-agent), a local voice support agent. That repo is about whether the agent answers correctly. This one is about how long the caller waits.
 
-Standard library Python 3.10+, no dependencies. Every stage is pluggable, and the unit tests and CI run the whole loop with fake stages, so they need no model or audio.
+The core is standard-library Python 3.10+. faster-whisper and Piper are optional extras. Every stage is pluggable, and the unit tests and CI run the whole loop with fake stages, so they need no model or audio.
 
 ## What it measures
 
@@ -38,14 +38,17 @@ Playback is simulated from each chunk's audio length (chunk *i* starts at the la
 
 ## Stages
 
-| stage | used here | notes |
+| stage | backends | notes |
 |---|---|---|
+| STT | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) `base.en`, int8 on CPU, beam 1 (optional) | model loaded once; WER against the known text is reported so a fast but wrong transcript shows up. Without it, the known transcript is used and STT is reported as **not measured** |
 | LLM | Ollama, streaming `/api/chat`, `think: false`, temperature 0, fixed seed, max 120 tokens | `--model`, `OLLAMA_URL` |
-| TTS | macOS `say` | writes a WAV file per chunk; "first audio" means the first chunk's file is complete, not a streamed first byte |
-| STT | none installed: the known transcript is used and STT is reported as **not measured** | see Known limits |
+| TTS | macOS `say` | a new process per chunk that writes a WAV file; killed on barge-in |
+| TTS | [Piper](https://github.com/OHF-Voice/piper1-gpl) `en_US-lessac-medium`, in-process (optional) | voice loaded once; cannot be interrupted mid-inference, so cancel waits for the current Piper sentence |
 | all | fake stages (`--fake`) | used by the tests and CI |
 
-`python -m vlab detect` shows what is installed. The tool never installs anything.
+"First audio" means the first chunk's audio is fully synthesized, for both TTS backends. Neither is measured as a streamed first byte.
+
+`python -m vlab detect` shows what is installed. The tool never installs anything by itself.
 
 ## Run it
 
@@ -55,7 +58,15 @@ python3 -m unittest discover -s tests -v          # offline, fake stages
 python3 -m vlab run --fake --reps 1 --out results/fake-demo
 ```
 
-On a Mac with Ollama running:
+On a Mac with Ollama running, optionally with the extras (about 230 MB of packages plus 210 MB of models):
+
+```bash
+uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python faster-whisper piper-tts
+.venv/bin/python -m piper.download_voices --data-dir models/piper en_US-lessac-medium
+.venv/bin/python -c "from faster_whisper import WhisperModel; WhisperModel('base.en', download_root='models/whisper')"
+```
+
+Then, from the repo root (use `.venv/bin/python` if you installed the extras):
 
 ```bash
 python3 -m vlab gen-utterances                    # 12 recorded questions, made with `say`, into audio/
@@ -73,8 +84,8 @@ Not yet committed: the real run is waiting for a quiet window on the test Mac (s
 
 ## Known limits
 
-- **No speech-to-text yet.** Neither whisper.cpp nor faster-whisper is installed on the test Mac, so STT time is not measured and the LLM gets the known transcript.
-- **`say` is not a streaming TTS.** It starts a process and writes a file per chunk, so "first audio" is when the first chunk's file is done.
+- **Synthetic speech in, not people.** The 12 recordings are made with `say`: clean, no noise, no accents. STT time and WER on real callers will be worse.
+- **No streamed first byte.** Both TTS backends are timed per chunk, so "first audio" is when the first chunk is fully synthesized.
 - **Shared machine.** Other jobs on the same Mac share its Ollama. Each run records the 1-minute load average and Ollama's loaded models at start and end in `env.json`; numbers from a busy machine are not comparable to a quiet one.
 - **Small sample.** 12 utterances × 3 repetitions = 36 turns per strategy, so p95 is close to the maximum.
 - **Regex chunking.** Sentence and clause boundaries are found with a regex; abbreviations such as "Dr. Smith" split early.
@@ -82,4 +93,4 @@ Not yet committed: the real run is waiting for a quiet window on the test Mac (s
 
 ## License
 
-MIT
+MIT for this repo. The optional extras keep their own licenses and are not bundled: Piper (`piper-tts`) is GPL-3.0-or-later, faster-whisper is MIT, and the downloaded voice and Whisper model carry their publishers' terms.

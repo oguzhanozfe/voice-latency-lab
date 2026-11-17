@@ -10,7 +10,7 @@ import re
 import threading
 import time
 
-from .stages import Cancelled
+from .stages import Cancelled, word_error_rate
 
 MODES = ("full", "sentence", "clause")
 
@@ -125,7 +125,7 @@ def run_turn(utt, stt, llm, tts, mode: str, barge_in_after: float | None = None,
         timer[0].join()  # an interrupt after all audio was ready still counts (it stops playback)
         worker.join()
     return {"utt": utt.id, "mode": mode if barge_in_after is None else f"barge-in after first {barge_in_anchor} ({mode})",
-            "transcript": transcript, "audio_in_s": utt.seconds, "events": sorted(events, key=lambda e: e["start"]),
+            "transcript": transcript, "ref_text": utt.text, "audio_in_s": utt.seconds, "events": sorted(events, key=lambda e: e["start"]),
             "marks": marks}
 
 
@@ -145,6 +145,8 @@ def metrics(turn: dict) -> dict:
          "stt_rtf": stt_s / turn["audio_in_s"] if stt["measured"] and turn["audio_in_s"] else None,
          "ttft_s": llm["first_token"] - llm["start"] if llm["first_token"] is not None else None,
          "llm_s": llm["end"] - llm["start"],
+         "stt_wer": word_error_rate(turn["ref_text"], turn["transcript"])
+         if stt["measured"] and "ref_text" in turn else None,
          "chunks": len(done), "reply_words": len(llm["text"].split())}
     stats = llm.get("stats") or {}
     if stats.get("eval_count") and stats.get("eval_duration"):
