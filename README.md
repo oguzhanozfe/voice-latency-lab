@@ -80,7 +80,35 @@ The utterance texts are in `utterances.txt`. The audio is generated on your mach
 
 ## Results
 
-Not yet committed: the real run is waiting for a quiet window on the test Mac (see Known limits).
+Run [`results/m5pro-qwen3.5-9b`](results/m5pro-qwen3.5-9b): Apple M5 Pro, 24 GB, macOS 27.2.1, Python 3.12.
+- **LLM:** Ollama 0.33.3 with `qwen3.5:9b` (Q4_K_M, digest `56671c2ab938`).
+- **STT:** faster-whisper 1.2.1 `base.en`, int8 on CPU.
+- **TTS:** Piper 1.8.0 `en_US-lessac-medium`, in-process, and macOS `say -v Samantha`.
+
+That is 12 utterances × 3 repetitions = **36 turns per row**, 360 turns in all, none skipped. Package versions and model file hashes are in [`env.json`](results/m5pro-qwen3.5-9b/env.json), every event is in `turns.jsonl`, and the timelines are in [`waterfall.html`](results/m5pro-qwen3.5-9b/waterfall.html), which shows the first repetition.
+
+**The machine was not idle.** Other jobs shared this Mac, so the per-turn 1-minute load average ran from 2.3 to 10.1 (median 5.0). In one stretch of about 70 consecutive turns, another process was using Ollama, and time to first token went above 1 s. The **p50 values are the comparison**; the p95 values mostly show that contention, not the pipeline.
+
+Time from the end of the user's speech to the first audio chunk ready, in ms:
+
+| TTS | full reply | sentence streaming | first-clause start |
+|---|---|---|---|
+| `say` (process per chunk) | 2397 | 1661 | 1637 |
+| Piper (in-process) | 1629 | 800 | 771 |
+
+The p50 parts of one Piper sentence-streaming turn: STT 254 ms, first LLM token 70 ms after the transcript, first audio 542 ms after the transcript. The full table is in [`summary.md`](results/m5pro-qwen3.5-9b/summary.md).
+
+What the numbers say:
+
+- **Sentence streaming is the trick that matters.** It cuts first audio by about 0.8 s with Piper and about 0.7 s with `say`, because the first sentence (about a third of a 35-word reply) is synthesized while the LLM is still writing the rest.
+- **Starting at the first clause adds almost nothing**: 24–29 ms. Short openers ("Sure,") are merged into the next chunk (minimum 3 words), and the first sentences here are short anyway.
+- **The TTS engine matters as much as the strategy.** `say` launches a process per chunk: TTS real-time factor 0.18 (time spent synthesizing ÷ length of audio produced). Piper keeps its voice loaded: real-time factor 0.02. Piper with no streaming (1629 ms) is about as fast as `say` with streaming (1661 ms).
+- **No mid-reply silence in any turn** (gap p95 = 0). Both engines synthesize much faster than the audio plays, so once the first chunk is ready the rest keeps up.
+- **STT costs about 255 ms** for 2.5–4 s questions (real-time factor 0.08, the time to transcribe ÷ length of the recording). The word error rate is 0 on every utterance except one: "opened electronics" became "open electronics" in all 30 of that utterance's turns.
+- **Barge-in is cheap to cancel.** Shutting the Ollama socket stops the LLM in under 1 ms (p95 1 ms). Killing `say` takes 1–3 ms. Piper cannot be interrupted mid-inference, so cancel waits for the current sentence: p50 0 ms, p95 40 ms. Of 144 barge-ins, the LLM was still generating in 102.
+- **Cancelled generations really stop.** A tiny request sent straight after each barge-in got its first token in 169 ms (p50). That matches the 153 ms of other requests whose prompt was not already cached, so Ollama was not still working on the cancelled reply.
+
+A confound to know about: Ollama caches the prompt prefix, and the turns for one utterance run back to back. A turn that repeats the previous turn's prompt gets its first token in about 91 ms (p50, 324 turns). A turn with a new prompt takes about 153 ms (36 turns). The "full" turn always comes first for each utterance, after a probe with a different prompt, so it pays about 60–80 ms more. That is small next to the 700–800 ms streaming gain, but the gaps between rows are slightly inflated by it.
 
 ## Known limits
 
@@ -88,6 +116,8 @@ Not yet committed: the real run is waiting for a quiet window on the test Mac (s
 - **No streamed first byte.** Both TTS backends are timed per chunk, so "first audio" is when the first chunk is fully synthesized.
 - **Shared machine.** Other jobs on the same Mac share its Ollama. Each run records the 1-minute load average and Ollama's loaded models at start and end in `env.json`; numbers from a busy machine are not comparable to a quiet one.
 - **Small sample.** 12 utterances × 3 repetitions = 36 turns per strategy, so p95 is close to the maximum.
+- **Prompt cache.** Turns for one utterance share a cached prompt (see Results). Shuffling the order or adding a per-turn nonce would remove that.
+- **CPU load is not GPU load.** The recorded load average does not see another process using Ollama on the GPU. The contended stretch shows up in time to first token, not in the load column.
 - **Regex chunking.** Sentence and clause boundaries are found with a regex; abbreviations such as "Dr. Smith" split early.
 - **One model, one voice, one machine.** The numbers say nothing about other hardware.
 
