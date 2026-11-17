@@ -117,7 +117,7 @@ Run [`results/m5pro-gemini-3.5-flash-lite`](results/m5pro-gemini-3.5-flash-lite)
 | local `qwen3.5:9b` (180 turns) | 145 / 5300 ms | 800 ms |
 | Gemini free tier, cloud (60 turns) | 1307 / 14354 ms | 1301 ms |
 
-On this setup the local 9B model starts answering about 1.2 s sooner at the median, and its worst cases are far less extreme. The cloud numbers depend on free-tier queueing and the network on this day, not just on the model, so read them as one sample. Gemini also streams in a few large pieces rather than token by token, so the LLM had already finished in 21 of its 24 barge-ins.
+On this setup the local 9B model starts answering about 1.2 s sooner at the median, and its worst cases are far less extreme. The cloud numbers depend on free-tier queueing and the network on this day, not just on the model, so read them as one sample. Its LLM had already finished in 21 of the 24 barge-ins. A likely reason is that Gemini streams in a few large pieces: one response checked by hand arrived in three. The run files do not record piece counts.
 
 A confound to know about: Ollama caches the prompt prefix, and the turns for one utterance run back to back. A turn that repeats the previous turn's prompt gets its first token in about 91 ms (p50, 324 turns). A turn with a new prompt takes about 153 ms (36 turns). The "full" turn always comes first for each utterance, after a probe with a different prompt, so it pays about 60–80 ms more. That is small next to the 700–800 ms streaming gain, but the gaps between rows are slightly inflated by it.
 
